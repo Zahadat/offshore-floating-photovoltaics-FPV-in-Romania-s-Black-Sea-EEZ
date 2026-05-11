@@ -1,0 +1,633 @@
+"""
+Romania Offshore FPV Feasibility Mapping
+=========================================
+Adapted from: Khaksar et al. (2026)
+"Mapping feasibility and energy potential of offshore floating photovoltaics in Italy"
+Energy for Sustainable Development, https://doi.org/10.1016/j.esd.2026.102018
+
+Study area  : Romania Black Sea EEZ
+Projection  : EPSG:32635 (UTM Zone 35N)
+Resolution  : 300 m x 300 m (matches CMEMS native resolution for Black Sea)
+
+REQUIRED DATA (download before running):
+-----------------------------------------
+1. Romania EEZ shapefile
+   -> https://marineregions.org  (search "Romania EEZ", download as GeoJSON)
+
+2. GEBCO Bathymetry (NetCDF, ~230m native res)
+   -> https://download.gebco.net  (sub-region: lon 28-32, lat 43-46.5)
+
+3. Black Sea Waves Reanalysis (NetCDF) - Hs, Tp
+   Product : BLKSEA_MULTIYEAR_WAV_007_006
+   Variables: VHM0 (Hs), VTPK (Tp)
+   -> https://data.marine.copernicus.eu
+
+4. Black Sea Physics Reanalysis (NetCDF) - currents, sea level
+   Product : BLKSEA_MULTIYEAR_PHY_007_004
+   Variables: uo, vo (currents m/s), zos (sea surface height m)
+   -> https://data.marine.copernicus.eu
+
+5. ERA5 Reanalysis (NetCDF) - wind, temperature, solar
+   Variables: u10, v10 (wind), t2m (temp), ssrd (GHI), fdir (DNI)
+   -> https://cds.climate.copernicus.eu  (DOI: 10.24381/cds.adbb2d47)
+   Region: lon 28-32, lat 43-46.5, 2000-2023
+
+6. Natura 2000 Protected Areas (shapefile)
+   -> https://www.eea.europa.eu/data-and-maps/data/natura-14
+   (filter to Romania, or clip to Black Sea coast)
+
+7. Ferry routes (GeoJSON from OpenStreetMap)
+   -> https://overpass-turbo.eu
+   Query: [out:json]; way["route"="ferry"](43,28,47,32); out geom;
+
+8. Global Fishing Watch (Apparent Fishing Effort, GeoTiff or CSV)
+   -> https://globalfishingwatch.org/datasets-and-code/
+   (annual fishing hours, 0.1 deg grid, Black Sea region)
+
+DEPENDENCIES:
+    pip install numpy pandas geopandas rasterio xarray scipy matplotlib
+    pip install netCDF4 pyproj shapely cartopy
+"""
+
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.warp import reproject, Resampling, calculate_default_transform
+from rasterio.features import rasterize
+from rasterio.mask import mask as rio_mask
+import xarray as xr
+from scipy.ndimage import distance_transform_edt
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import Patch
+import os
+
+# ─────────────────────────────────────────────────
+# 0.  CONFIGURATION
+# ─────────────────────────────────────────────────
+
+CRS        = "EPSG:32635"          # UTM Zone 35N – Romania
+RESOLUTION = 300                   # grid cell size in metres
+NODATA     = -9999.0
+
+# Bounding box of Romania Black Sea EEZ (approx), in WGS84
+BBOX_WGS84 = (28.5, 43.5, 31.5, 46.5)   # (lon_min, lat_min, lon_max, lat_max)
+
+# File paths  – update to match your downloaded files
+PATHS = {
+    "eez"          : "data/romania_eez.geojson",
+    "bathymetry"   : "data/gebco_romania.nc",
+    "waves"        : "data/blksea_waves_reanalysis.nc",
+    "physics"      : "data/blksea_physics_reanalysis.nc",
+    "era5"         : "data/era5_romania.nc",
+    "natura2000"   : "data/natura2000_romania.shp",
+    "ferry"        : "data/ferry_routes_romania.geojson",
+    "fishing"      : "data/gfw_fishing_romania.tif",
+    "output_dir"   : "outputs/",
+}
+
+os.makedirs(PATHS["output_dir"], exist_ok=True)
+
+
+# ─────────────────────────────────────────────────
+# 1.  SCORING FUNCTIONS  (Table 2, Khaksar et al.)
+#     All return a score in [0, 1]
+# ─────────────────────────────────────────────────
+
+def score_piecewise(x, segments):
+    """
+    Generic piecewise-linear scorer.
+    segments : list of (x_break, score_break) tuples, sorted by x.
+    Values below first break use first score; above last break use last score.
+    """
+    xs = [s[0] for s in segments]
+    ys = [s[1] for s in segments]
+    return np.interp(x, xs, ys)
+
+
+def score_wave_height(hs):
+    """Significant wave height Hs [m]  ->  score [0,1]"""
+    return score_piecewise(hs, [(0, 1.0), (2, 1.0), (5, 0.2), (10, 0.0), (1e9, 0.0)])
+
+
+def score_peak_period(tp):
+    """Spectral peak period Tp [s]  ->  score [0,1]"""
+    return score_piecewise(tp, [(0, 0.0), (4, 1.0), (8, 1.0), (16, 0.0), (1e9, 0.0)])
+
+
+def score_wind_speed(ws):
+    """10 m wind speed [m/s]  ->  score [0,1]"""
+    return score_piecewise(ws, [(0, 1.0), (5, 1.0), (20, 0.3), (25, 0.0), (1e9, 0.0)])
+
+
+def score_bathymetry(depth):
+    """
+    Water depth [m, positive values]  ->  score [0,1].
+    Note: GEBCO depth is negative (below sea level) – pass abs(depth).
+    """
+    return score_piecewise(depth,
+        [(0, 1.0), (5, 1.0), (20, 0.3), (200, 0.1), (1000, 0.0), (1e9, 0.0)])
+
+
+def score_current_speed(cs):
+    """Current speed [m/s]  ->  score [0,1]"""
+    return score_piecewise(cs, [(0, 1.0), (2, 0.0), (1e9, 0.0)])
+
+
+def score_distance_to_shore(d_km):
+    """Distance to nearest shoreline [km]  ->  score [0,1]"""
+    return score_piecewise(d_km,
+        [(0, 1.0), (5, 1.0), (30, 0.1), (60, 0.0), (1e9, 0.0)])
+
+
+def score_water_level_variation(wlv):
+    """Water-level variation [m]  ->  score [0,1]"""
+    return score_piecewise(wlv, [(0, 1.0), (1, 1.0), (7, 0.0), (1e9, 0.0)])
+
+
+def score_fishing_activity(hours):
+    """Annual apparent fishing effort [hours]  ->  score [0,1]"""
+    return score_piecewise(hours, [(0, 1.0), (10, 1.0), (200, 0.0), (1e9, 0.0)])
+
+
+def compute_hsi(score_hs, score_tp):
+    """
+    Hydrodynamic Severity Index  (Eq. 1, Khaksar et al.)
+    HSI = sqrt( score_Hs^2  *  score_Tp^0.5 )
+    Range stays [0,1] because inputs are already normalised.
+    """
+    return np.sqrt(score_hs**2 * score_tp**0.5)
+
+
+# ─────────────────────────────────────────────────
+# 2.  PARAMETER WEIGHTS  (Table 3, Khaksar et al.)
+#     Total = 100 %  (protected areas & ferry routes
+#     are applied as hard binary masks, not weights)
+# ─────────────────────────────────────────────────
+
+WEIGHTS = {
+    "hsi"              : 0.20,
+    "wind_speed"       : 0.20,
+    "bathymetry"       : 0.15,
+    "current_speed"    : 0.13,
+    "distance_to_shore": 0.12,
+    "water_level"      : 0.10,
+    "fishing"          : 0.10,
+}
+assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1"
+
+
+# ─────────────────────────────────────────────────
+# 3.  GRID SETUP HELPERS
+# ─────────────────────────────────────────────────
+
+def build_grid(eez_gdf, resolution=RESOLUTION, crs=CRS):
+    """
+    Return (transform, width, height) for the analysis raster,
+    derived from the EEZ polygon extent.
+    """
+    eez_proj = eez_gdf.to_crs(crs)
+    bounds = eez_proj.total_bounds          # (xmin, ymin, xmax, ymax)
+    width  = int((bounds[2] - bounds[0]) / resolution)
+    height = int((bounds[3] - bounds[1]) / resolution)
+    transform = from_bounds(*bounds, width=width, height=height)
+    return transform, width, height, bounds
+
+
+def clip_and_resample_raster(src_path, eez_gdf, transform, width, height,
+                              variable=None, crs=CRS, resample=Resampling.bilinear):
+    """
+    Open a raster (GeoTiff or NetCDF), clip to EEZ bounds, resample to grid.
+    Returns a 2-D numpy array.
+    """
+    eez_proj = eez_gdf.to_crs(crs)
+    shapes = [geom.__geo_interface__ for geom in eez_proj.geometry]
+
+    with rasterio.open(src_path) as src:
+        dst_crs = crs
+        dst_transform, dst_w, dst_h = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds)
+
+        # Build destination array at target resolution
+        data = np.empty((height, width), dtype=np.float32)
+        data[:] = NODATA
+
+        reproject(
+            source       = rasterio.band(src, 1),
+            destination  = data,
+            src_transform= src.transform,
+            src_crs      = src.crs,
+            dst_transform= transform,
+            dst_crs      = dst_crs,
+            resampling   = resample,
+            dst_nodata   = NODATA,
+        )
+    return data
+
+
+def nc_p95(nc_path, var_name, lat_bounds, lon_bounds):
+    """
+    Load a CMEMS / ERA5 NetCDF, select the Romania Black Sea region,
+    compute the 95th-percentile over the time dimension.
+    Returns a 2-D xarray.DataArray.
+    """
+    ds = xr.open_dataset(nc_path)
+    lat_name = [v for v in ds.dims if "lat" in v.lower()][0]
+    lon_name = [v for v in ds.dims if "lon" in v.lower()][0]
+    ds = ds.sel(**{
+        lat_name: slice(lat_bounds[0], lat_bounds[1]),
+        lon_name: slice(lon_bounds[0], lon_bounds[1]),
+    })
+    da = ds[var_name]
+    return da.quantile(0.95, dim="time")
+
+
+def rasterize_vector(gdf, transform, width, height,
+                     burn_value=0, default_value=1):
+    """
+    Burn vector geometries into a raster grid.
+    Areas inside the geometries get burn_value; outside get default_value.
+    """
+    out = np.full((height, width), default_value, dtype=np.float32)
+    shapes = ((geom, burn_value) for geom in gdf.geometry)
+    rasterize(shapes=shapes,
+              out=out,
+              transform=transform,
+              fill=default_value,
+              default_value=burn_value)
+    return out
+
+
+def distance_to_shore_km(coastline_gdf, transform, width, height, crs=CRS):
+    """
+    Compute Euclidean distance (km) from every cell to the nearest coastline.
+    Uses distance_transform_edt on a binary coast mask.
+    """
+    coast_proj = coastline_gdf.to_crs(crs)
+    coast_mask = np.ones((height, width), dtype=np.uint8)
+    shapes = [(geom, 0) for geom in coast_proj.geometry]
+    rasterize(shapes=shapes, out=coast_mask, transform=transform,
+              fill=1, default_value=0)
+    dist_px = distance_transform_edt(coast_mask)
+    dist_m  = dist_px * RESOLUTION
+    return dist_m / 1000.0   # convert to km
+
+
+# ─────────────────────────────────────────────────
+# 4.  MAIN PROCESSING PIPELINE
+# ─────────────────────────────────────────────────
+
+def run_feasibility_model(paths=PATHS, weights=WEIGHTS):
+    print("=" * 60)
+    print("Romania Offshore FPV Feasibility Mapping")
+    print("=" * 60)
+
+    # ── 4.1  Load EEZ ──────────────────────────────────────────
+    print("\n[1/8] Loading Romania EEZ...")
+    eez = gpd.read_file(paths["eez"])
+    transform, width, height, bounds = build_grid(eez)
+    print(f"      Grid: {width} x {height} cells @ {RESOLUTION} m")
+
+    # EEZ mask (1 = inside, 0 = outside)
+    eez_proj = eez.to_crs(CRS)
+    eez_mask = rasterize_vector(eez_proj, transform, width, height,
+                                burn_value=1, default_value=0)
+
+    lat_bounds = (BBOX_WGS84[1], BBOX_WGS84[3])
+    lon_bounds = (BBOX_WGS84[0], BBOX_WGS84[2])
+
+    # ── 4.2  Bathymetry ────────────────────────────────────────
+    print("[2/8] Processing bathymetry (GEBCO)...")
+    ds_bath = xr.open_dataset(paths["bathymetry"])
+    # GEBCO variable is 'elevation' (negative = below sea level)
+    bathy_da = ds_bath["elevation"].sel(
+        lat=slice(lat_bounds[0], lat_bounds[1]),
+        lon=slice(lon_bounds[0], lon_bounds[1]),
+    )
+    bathy_da.rio.write_crs("EPSG:4326", inplace=True)
+    bathy_da.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
+    tmp_bathy = paths["output_dir"] + "tmp_bathy.tif"
+    bathy_da.rio.to_raster(tmp_bathy)
+    bathy_raw = clip_and_resample_raster(tmp_bathy, eez, transform, width, height)
+    depth_m   = np.where(bathy_raw < 0, -bathy_raw, 0)  # positive depth values
+    s_bathy   = score_bathymetry(depth_m)
+
+    # ── 4.3  Wave conditions (Hs, Tp) – P95 ───────────────────
+    print("[3/8] Processing wave conditions (CMEMS Black Sea Waves)...")
+    hs_p95 = nc_p95(paths["waves"], "VHM0", lat_bounds, lon_bounds)
+    tp_p95 = nc_p95(paths["waves"], "VTPK", lat_bounds, lon_bounds)
+
+    hs_p95.rio.write_crs("EPSG:4326", inplace=True)
+    tp_p95.rio.write_crs("EPSG:4326", inplace=True)
+    hs_p95.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude", inplace=True)
+    tp_p95.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude", inplace=True)
+
+    tmp_hs = paths["output_dir"] + "tmp_hs.tif"
+    tmp_tp = paths["output_dir"] + "tmp_tp.tif"
+    hs_p95.rio.to_raster(tmp_hs)
+    tp_p95.rio.to_raster(tmp_tp)
+
+    hs_grid = clip_and_resample_raster(tmp_hs, eez, transform, width, height)
+    tp_grid = clip_and_resample_raster(tmp_tp, eez, transform, width, height)
+
+    s_hs  = score_wave_height(hs_grid)
+    s_tp  = score_peak_period(tp_grid)
+    s_hsi = compute_hsi(s_hs, s_tp)
+
+    # ── 4.4  Wind speed (ERA5) – P95 ──────────────────────────
+    print("[4/8] Processing wind speed (ERA5)...")
+    u10 = nc_p95(paths["era5"], "u10", lat_bounds, lon_bounds)
+    v10 = nc_p95(paths["era5"], "v10", lat_bounds, lon_bounds)
+    ws_p95_da = np.sqrt(u10**2 + v10**2)
+    ws_p95_da.name = "ws"
+    ws_p95_da.rio.write_crs("EPSG:4326", inplace=True)
+    ws_p95_da.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude", inplace=True)
+    tmp_ws = paths["output_dir"] + "tmp_ws.tif"
+    ws_p95_da.rio.to_raster(tmp_ws)
+    ws_grid = clip_and_resample_raster(tmp_ws, eez, transform, width, height)
+    s_wind  = score_wind_speed(ws_grid)
+
+    # ── 4.5  Current speed (CMEMS Physics) – P95 ──────────────
+    print("[5/8] Processing currents (CMEMS Black Sea Physics)...")
+    uo = nc_p95(paths["physics"], "uo", lat_bounds, lon_bounds)
+    vo = nc_p95(paths["physics"], "vo", lat_bounds, lon_bounds)
+    cs_p95_da = np.sqrt(uo**2 + vo**2)
+    cs_p95_da.name = "cs"
+    cs_p95_da.rio.write_crs("EPSG:4326", inplace=True)
+    cs_p95_da.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude", inplace=True)
+    tmp_cs = paths["output_dir"] + "tmp_cs.tif"
+    cs_p95_da.rio.to_raster(tmp_cs)
+    cs_grid = clip_and_resample_raster(tmp_cs, eez, transform, width, height)
+    s_curr  = score_current_speed(cs_grid)
+
+    # Water-level variation (std dev of sea surface height zos)
+    ds_phy = xr.open_dataset(paths["physics"])
+    lat_name = [v for v in ds_phy.dims if "lat" in v.lower()][0]
+    lon_name = [v for v in ds_phy.dims if "lon" in v.lower()][0]
+    zos = ds_phy["zos"].sel(**{
+        lat_name: slice(lat_bounds[0], lat_bounds[1]),
+        lon_name: slice(lon_bounds[0], lon_bounds[1]),
+    })
+    # Water-level variation = range between 5th and 95th percentile SSH
+    wlv_da = zos.quantile(0.95, dim="time") - zos.quantile(0.05, dim="time")
+    wlv_da.name = "wlv"
+    wlv_da.rio.write_crs("EPSG:4326", inplace=True)
+    wlv_da.rio.set_spatial_dims(x_dim=lon_name, y_dim=lat_name, inplace=True)
+    tmp_wlv = paths["output_dir"] + "tmp_wlv.tif"
+    wlv_da.rio.to_raster(tmp_wlv)
+    wlv_grid = clip_and_resample_raster(tmp_wlv, eez, transform, width, height)
+    s_wlv = score_water_level_variation(np.abs(wlv_grid))
+
+    # ── 4.6  Distance to shore ─────────────────────────────────
+    print("[6/8] Computing distance to shore...")
+    # Use EEZ coastline boundary as the shore reference
+    coast_line = eez_proj.boundary
+    coast_gdf  = gpd.GeoDataFrame(geometry=coast_line, crs=CRS)
+    d_shore    = distance_to_shore_km(coast_gdf, transform, width, height)
+    s_dist     = score_distance_to_shore(d_shore)
+
+    # ── 4.7  Fishing activity (Global Fishing Watch) ───────────
+    print("[7/8] Processing fishing activity (GFW)...")
+    fishing_grid = clip_and_resample_raster(
+        paths["fishing"], eez, transform, width, height,
+        resample=Resampling.average)
+    fishing_grid = np.where(fishing_grid == NODATA, 0, fishing_grid)
+    s_fishing = score_fishing_activity(fishing_grid)
+
+    # ── 4.8  Binary exclusion masks ───────────────────────────
+    print("[8/8] Applying exclusion masks (Natura 2000, ferry routes)...")
+    natura  = gpd.read_file(paths["natura2000"]).to_crs(CRS)
+    # 1 km buffer around protected areas
+    natura_buf = gpd.GeoDataFrame(geometry=natura.buffer(1000), crs=CRS)
+    mask_mpa   = rasterize_vector(natura_buf, transform, width, height,
+                                  burn_value=0, default_value=1)
+
+    ferry   = gpd.read_file(paths["ferry"]).to_crs(CRS)
+    # 1 km buffer around ferry routes
+    ferry_buf  = gpd.GeoDataFrame(geometry=ferry.buffer(1000), crs=CRS)
+    mask_ferry = rasterize_vector(ferry_buf, transform, width, height,
+                                  burn_value=0, default_value=1)
+
+    # ── 4.9  Weighted composite feasibility index (Eq. 2) ─────
+    print("\nComputing composite feasibility index...")
+    F = (
+        weights["hsi"]               * s_hsi    +
+        weights["wind_speed"]        * s_wind   +
+        weights["bathymetry"]        * s_bathy  +
+        weights["current_speed"]     * s_curr   +
+        weights["distance_to_shore"] * s_dist   +
+        weights["water_level"]       * s_wlv    +
+        weights["fishing"]           * s_fishing
+    ) * mask_mpa * mask_ferry * eez_mask
+
+    F = np.where(eez_mask == 0, np.nan, F)
+
+    # ── 4.10  Save outputs ─────────────────────────────────────
+    profile = {
+        "driver"   : "GTiff",
+        "dtype"    : "float32",
+        "width"    : width,
+        "height"   : height,
+        "count"    : 1,
+        "crs"      : CRS,
+        "transform": transform,
+        "nodata"   : np.nan,
+    }
+    out_raster = paths["output_dir"] + "romania_fpv_feasibility.tif"
+    with rasterio.open(out_raster, "w", **profile) as dst:
+        dst.write(F.astype("float32"), 1)
+    print(f"Feasibility raster saved → {out_raster}")
+
+    # ── 4.11  Area statistics ──────────────────────────────────
+    cell_area_km2 = (RESOLUTION / 1000)**2
+    print("\n── Feasibility class statistics ─────────────────────")
+    print(f"{'Class':<12}  {'Area (km²)':>12}  {'% of EEZ':>10}")
+    total_eez_km2 = np.nansum(eez_mask) * cell_area_km2
+    for lo in np.arange(0, 1.0, 0.1):
+        hi   = lo + 0.1
+        n    = np.nansum((F >= lo) & (F < hi))
+        area = n * cell_area_km2
+        pct  = 100 * area / total_eez_km2 if total_eez_km2 > 0 else 0
+        label = f"{lo:.1f}–{hi:.1f}"
+        print(f"  {label:<10}  {area:>12.1f}  {pct:>9.2f}%")
+
+    return F, transform, width, height, eez_proj
+
+
+# ─────────────────────────────────────────────────
+# 5.  ENERGY POTENTIAL  (Eq. 3 + 11, Khaksar et al.)
+# ─────────────────────────────────────────────────
+
+def estimate_energy_potential(feasibility_array, transform,
+                               era5_path, lat_bounds, lon_bounds,
+                               waves_path, output_dir,
+                               eez, width, height):
+    """
+    Estimates the capacity factor (CF) and annual energy potential
+    for offshore FPV in each feasibility class ≥ 0.7.
+
+    Power density from Table 4 of the paper (mean across applicable technologies):
+        class 0.7–0.8 : 137.5 MW/km²
+        class 0.8–0.9 : 131.5 MW/km²
+        class 0.9–1.0 : 131.5 MW/km²
+    """
+    POWER_DENSITY = {(0.7, 0.8): 137.5, (0.8, 0.9): 131.5, (0.9, 1.0): 131.5}
+    CF_SCENARIOS  = {"conservative": 0.15, "intermediate": 0.18, "optimistic": 0.20}
+    cell_area_km2 = (RESOLUTION / 1000)**2
+
+    print("\n── Energy potential by feasibility class ─────────────")
+    for (lo, hi), rho in POWER_DENSITY.items():
+        mask_class  = (feasibility_array >= lo) & (feasibility_array < hi)
+        area_km2    = float(np.nansum(mask_class)) * cell_area_km2
+        cap_GW      = rho * area_km2 / 1e3
+        print(f"\n  Class {lo:.1f}–{hi:.1f}  |  Area: {area_km2:,.0f} km²"
+              f"  |  Capacity: {cap_GW:,.1f} GW")
+        for scenario, cf in CF_SCENARIOS.items():
+            energy_TWh = cap_GW * cf * 8760 / 1e3
+            print(f"    {scenario:<14}  CF={cf:.0%}  ->  {energy_TWh:,.0f} TWh/yr")
+
+    # Romania's electricity consumption (approx. 52 TWh in 2023, Eurostat)
+    ROMANIA_DEMAND_TWH = 52.0
+    print(f"\n  Romania 2023 electricity demand: {ROMANIA_DEMAND_TWH} TWh")
+    print("  Share of feasible area (≥0.7) needed to cover demand:")
+    total_area = float(np.nansum(feasibility_array >= 0.7)) * cell_area_km2
+    for scenario, cf in CF_SCENARIOS.items():
+        rho_mean = 135.0
+        needed_area = ROMANIA_DEMAND_TWH * 1e9 / (rho_mean * 1e6 * cf * 8760)
+        pct = 100 * needed_area / total_area if total_area > 0 else float("inf")
+        print(f"    {scenario:<14} CF={cf:.0%}  ->  {needed_area:,.0f} km²"
+              f"  ({pct:.1f}% of feasible area)")
+
+
+# ─────────────────────────────────────────────────
+# 6.  VISUALISATION
+# ─────────────────────────────────────────────────
+
+def plot_feasibility_map(feasibility_array, transform, eez_gdf,
+                          output_dir=PATHS["output_dir"]):
+    """
+    Reproduce the colour scheme from Fig. 2 of Khaksar et al.:
+    green (low) → yellow → orange → red (high).
+    """
+    fig, ax = plt.subplots(figsize=(8, 10), dpi=150)
+
+    # Colour map matching paper  (green=low feasibility, red=high)
+    colors_hex = [
+        "#006400", "#228B22", "#66BB6A",
+        "#CDDC39", "#FFF176", "#FFD54F",
+        "#FFB74D", "#FF8A65", "#E64A19", "#B71C1C"
+    ]
+    cmap = mcolors.ListedColormap(colors_hex)
+    bounds_cmap = np.arange(0, 1.1, 0.1)
+    norm = mcolors.BoundaryNorm(bounds_cmap, cmap.N)
+
+    # Compute extent in geographic coordinates for display
+    from rasterio.transform import array_bounds
+    left, bottom, right, top = array_bounds(
+        feasibility_array.shape[0], feasibility_array.shape[1], transform)
+    extent = [left, right, bottom, top]
+
+    img = ax.imshow(feasibility_array, cmap=cmap, norm=norm,
+                    extent=extent, origin="upper")
+
+    # EEZ boundary
+    eez_gdf.boundary.plot(ax=ax, color="black", linewidth=0.8)
+
+    # Contour line for feasibility ≥ 0.7
+    ax.contour(feasibility_array, levels=[0.7], colors="black",
+               linewidths=0.6,
+               extent=extent, origin="upper")
+
+    cbar = plt.colorbar(img, ax=ax, fraction=0.03, pad=0.02, ticks=bounds_cmap)
+    cbar.set_label("Feasibility Score", fontsize=10)
+
+    legend_elements = [
+        Patch(facecolor=colors_hex[i],
+              label=f"{0.1*i:.1f}–{0.1*(i+1):.1f}")
+        for i in range(10)
+    ]
+    ax.legend(handles=legend_elements, title="Feasibility Score",
+              loc="lower left", fontsize=7, title_fontsize=8,
+              framealpha=0.9)
+
+    ax.set_title("Offshore FPV Feasibility – Romania (Black Sea)", fontsize=12)
+    ax.set_xlabel("Easting [m]")
+    ax.set_ylabel("Northing [m]")
+
+    out_path = output_dir + "romania_fpv_feasibility_map.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.show()
+    print(f"Map saved → {out_path}")
+
+
+# ─────────────────────────────────────────────────
+# 7.  SENSITIVITY ANALYSIS  (Section 4.4 of paper)
+#     Vary HSI and wind weights by ±5 % as in the paper
+# ─────────────────────────────────────────────────
+
+def sensitivity_analysis(scored_layers, eez_mask, mask_mpa, mask_ferry,
+                          base_weights=WEIGHTS):
+    """
+    Run 4 alternative weighting scenarios (Table in Fig. 5 of paper):
+        HSI-high, HSI-low, Wind-high, Wind-low
+    Returns dict of scenario_name -> feasibility array.
+    """
+    def rescale(w_base, param, delta):
+        w = dict(w_base)
+        w[param] += delta
+        # Redistribute remainder proportionally among other params
+        others = {k: v for k, v in w.items() if k != param}
+        scale  = (1 - w[param]) / sum(others.values())
+        for k in others:
+            w[k] = others[k] * scale
+        return w
+
+    scenarios = {
+        "HSI-high" : rescale(base_weights, "hsi",        +0.05),
+        "HSI-low"  : rescale(base_weights, "hsi",        -0.05),
+        "Wind-high": rescale(base_weights, "wind_speed",  +0.05),
+        "Wind-low" : rescale(base_weights, "wind_speed",  -0.05),
+    }
+
+    results = {}
+    for name, w in scenarios.items():
+        F = (
+            w["hsi"]               * scored_layers["hsi"]      +
+            w["wind_speed"]        * scored_layers["wind"]      +
+            w["bathymetry"]        * scored_layers["bathy"]     +
+            w["current_speed"]     * scored_layers["current"]   +
+            w["distance_to_shore"] * scored_layers["dist"]      +
+            w["water_level"]       * scored_layers["wlv"]       +
+            w["fishing"]           * scored_layers["fishing"]
+        ) * mask_mpa * mask_ferry * eez_mask
+        results[name] = np.where(eez_mask == 0, np.nan, F)
+        cell_area_km2 = (RESOLUTION / 1000)**2
+        area_07 = np.nansum(results[name] >= 0.7) * cell_area_km2
+        print(f"  {name:<12}  area ≥0.7 = {area_07:,.0f} km²")
+
+    return results
+
+
+# ─────────────────────────────────────────────────
+# 8.  ENTRY POINT
+# ─────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    F, transform, width, height, eez_proj = run_feasibility_model()
+
+    estimate_energy_potential(
+        feasibility_array = F,
+        transform         = transform,
+        era5_path         = PATHS["era5"],
+        lat_bounds        = (BBOX_WGS84[1], BBOX_WGS84[3]),
+        lon_bounds        = (BBOX_WGS84[0], BBOX_WGS84[2]),
+        waves_path        = PATHS["waves"],
+        output_dir        = PATHS["output_dir"],
+        eez               = eez_proj,
+        width             = width,
+        height            = height,
+    )
+
+    plot_feasibility_map(F, transform, eez_proj)
